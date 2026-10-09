@@ -127,10 +127,10 @@ async def reset_current_counter_at_utc_midnight():
 
 def _send_code_email(email: str, code: str, settings: Settings, current_count: int) -> None:
     """The blocking Resend call, isolated so it can be run off the event loop."""
-    resend.api_key = settings.resend_api_key if current_count<=100 else settings.resend_api_key_two
+    resend.api_key = settings.resend_api_key if current_count<=99 else settings.resend_api_key_two
     resend.Emails.send(
         {
-            "from": settings.resend_from_email,
+            "from": settings.resend_from_email if current_count<=99 else settings.resend_from_email_two,
             "to": [email],
             "subject": "Your Hungry Birds login code",
             "html": (

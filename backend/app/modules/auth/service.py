@@ -1,5 +1,6 @@
 import secrets
-
+import datetime
+import asyncio
 import anyio
 import resend
 from fastapi import BackgroundTasks, HTTPException, status
@@ -10,6 +11,7 @@ from app.core.tasks import fire_and_log
 
 OTP_TTL_SECONDS = 5 * 60
 OTP_RATE_LIMIT_SECONDS = 60
+current=75
 
 # A 6-digit code is only a million possibilities, so the code itself is not
 # the defence - limiting guesses is. After this many wrong attempts the code
@@ -93,10 +95,39 @@ def _attempt_key(email: str) -> str:
 def _hourly_key(email: str) -> str:
     return f"otp:hr:{email}"
 
+async def reset_current_counter_at_utc_midnight():
+    global current    
+    while True:
+        # 1. Get current time in UTC
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        
+        # 2. Calculate the next midnight UTC
+        tomorrow_utc = now_utc + datetime.timedelta(days=1)
+        next_midnight_utc = datetime.datetime(
+            tomorrow_utc.year, tomorrow_utc.month, tomorrow_utc.day, 
+            0, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        
+        # 3. Calculate exact seconds remaining until the reset
+        seconds_to_wait = (next_midnight_utc - now_utc).total_seconds()
+        
+        # 4. Sleep asynchronously (non-blocking) until midnight UTC
+        await asyncio.sleep(seconds_to_wait)
+        
+        # 5. Reset the global variable
+        current = 0
+        print(f"[{datetime.datetime.now()}] Success: Reset 'current' counter back to 0.")
+        
+        # Avoid race conditions if clocks drift slightly
+        await asyncio.sleep(2)
 
-def _send_code_email(email: str, code: str, settings: Settings) -> None:
+
+
+
+
+def _send_code_email(email: str, code: str, settings: Settings, current_count: int) -> None:
     """The blocking Resend call, isolated so it can be run off the event loop."""
-    resend.api_key = settings.resend_api_key
+    resend.api_key = settings.resend_api_key if current_count<=100 else settings.resend_api_key_two
     resend.Emails.send(
         {
             "from": settings.resend_from_email,
@@ -111,7 +142,7 @@ def _send_code_email(email: str, code: str, settings: Settings) -> None:
     )
 
 
-async def send_code_email(email: str, code: str, settings: Settings) -> None:
+async def send_code_email(email: str, code: str, settings: Settings, current_count: int) -> None:
     """Send a login code, without holding the event loop while Resend thinks.
 
     `resend.Emails.send` is synchronous `requests` under the hood. Called
@@ -120,7 +151,7 @@ async def send_code_email(email: str, code: str, settings: Settings) -> None:
     """
     if not settings.resend_api_key:
         return
-    await anyio.to_thread.run_sync(_send_code_email, email, code, settings)
+    await anyio.to_thread.run_sync(_send_code_email, email, code, settings, current_count)
 
 
 async def request_otp(
@@ -159,22 +190,63 @@ async def request_otp(
             "Too many codes requested for this address. Try again later.",
         )
 
+    # --- REDIS RESEND QUOTA TRACKING SYSTEM ---
+    resend_counter_key = "resend:daily:usage"
+    
+    # 1. Check if the counter key already exists in Redis
+    counter_exists = await redis.exists(resend_counter_key)
+    
+    if not counter_exists:
+        # Seed the counter at your current progress of 80 instead of starting at 1
+        await redis.set(resend_counter_key, 85)
+        current_count = 85
+        
+        # Calculate exactly how many seconds remain until the next UTC Midnight reset
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        tomorrow_utc = now_utc + datetime.timedelta(days=1)
+        next_midnight_utc = datetime.datetime(
+            tomorrow_utc.year, tomorrow_utc.month, tomorrow_utc.day, 
+            0, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        seconds_to_utc_midnight = int((next_midnight_utc - now_utc).total_seconds())
+        
+        # Set the key to self-destruct right at UTC Midnight
+        await redis.expire(resend_counter_key, seconds_to_utc_midnight)
+    else:
+        # If the key already exists, simply increment it atomically (80 -> 81 -> 82...)
+        current_count = await redis.incr(resend_counter_key)
+        
+        # If it rolls over to 1 (meaning it was wiped by the midnight expiration rule),
+        # re-apply the expiration window for the new day
+        if current_count == 1:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            tomorrow_utc = now_utc + datetime.timedelta(days=1)
+            next_midnight_utc = datetime.datetime(
+                tomorrow_utc.year, tomorrow_utc.month, tomorrow_utc.day, 
+                0, 0, 0, tzinfo=datetime.timezone.utc
+            )
+            seconds_to_utc_midnight = int((next_midnight_utc - now_utc).total_seconds())
+            await redis.expire(resend_counter_key, seconds_to_utc_midnight)
+    # ------------------------------------------
+
     code = f"{secrets.randbelow(1_000_000):06d}"
     await redis.set(_otp_key(email), code, ex=OTP_TTL_SECONDS)
     await redis.set(_rate_limit_key(email), "1", ex=OTP_RATE_LIMIT_SECONDS)
     # A new code starts a fresh attempt budget.
     await redis.delete(_attempt_key(email))
 
+    # Pass the current_count to send_code_email so it can switch keys at > 100
     if background is not None:
         background.add_task(
-            fire_and_log, "send_code_email", lambda: send_code_email(email, code, settings)
+            fire_and_log, "send_code_email", lambda: send_code_email(email, code, settings, current_count)
         )
     else:
         # No request to hang the task off (a script, or a test). Still guarded,
         # so a dead Resend cannot propagate out of here.
-        await fire_and_log("send_code_email", lambda: send_code_email(email, code, settings))
+        await fire_and_log("send_code_email", lambda: send_code_email(email, code, settings, current_count))
 
     return code if settings.debug_echo_enabled else None
+
 
 
 async def verify_otp(email: str, code: str, redis: Redis) -> bool:
